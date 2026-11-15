@@ -106,10 +106,34 @@ docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
   < supabase/migrations/20261020120000_persist_user_watchlists.sql
 docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
   -U postgres -d postgres \
+  < supabase/migrations/20261023120000_transaction_pagination_support_requests.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
+  < supabase/migrations/20261113090000_secure_financial_request_workflows.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
+  < supabase/tests/financial_workflow_upgrade_fixture.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
+  < supabase/migrations/20261113110000_internal_admin_financial_workflows.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
+  < supabase/migrations/20261113110000_internal_admin_financial_workflows.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
+  < supabase/tests/financial_workflow_upgrade_assertions.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
   < supabase/tests/accounting_local_assertions.sql
 docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
   -U postgres -d postgres \
   < supabase/tests/watchlist_local_assertions.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
+  < supabase/tests/support_requests_local_assertions.sql
+docker exec -i "$container" psql -X -v ON_ERROR_STOP=1 \
+  -U postgres -d postgres \
+  < supabase/tests/financial_request_workflows_local_assertions.sql
 
 run_request() {
   local actor_id="$1"
@@ -329,4 +353,4 @@ $assert_legacy_admin_send$;
 SQL
 
 printf '%s\n' \
-  'Local accounting tests passed: auth.uid policy preflight, spoofed UID rejection, atomic credits/transfers, admin sends, authorization, sequential/concurrent idempotent replay, payload mismatch, insufficient balance, reciprocal locking, concurrent overspend.'
+  'Local accounting tests passed: auth.uid policy preflight, spoofed UID rejection, atomic credits/transfers, admin sends, authorization, sequential/concurrent idempotent replay, payload mismatch, insufficient balance, reciprocal locking, concurrent overspend; support request RLS and least-privilege assertions also passed.'

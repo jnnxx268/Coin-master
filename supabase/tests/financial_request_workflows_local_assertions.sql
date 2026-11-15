@@ -1,0 +1,860 @@
+\set ON_ERROR_STOP on
+
+UPDATE auth.users
+SET raw_user_meta_data = '{"full_name":"Financial User"}'
+WHERE id = '80000000-0000-0000-0000-000000000008';
+UPDATE auth.users
+SET raw_user_meta_data = '{"full_name":"Other User"}'
+WHERE id = '90000000-0000-0000-0000-000000000009';
+INSERT INTO public.wallet_balances (user_id, asset, balance)
+VALUES ('80000000-0000-0000-0000-000000000008', 'BTC', 1000)
+ON CONFLICT (user_id, asset)
+DO UPDATE SET balance = EXCLUDED.balance;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '80000000-0000-0000-0000-000000000008',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"80000000-0000-0000-0000-000000000008","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+SELECT public.create_deposit_request(
+  'BTC',
+  300,
+  'f3000000-0000-0000-0000-000000000001'
+);
+SELECT public.create_deposit_request(
+  'BTC',
+  300,
+  'f3000000-0000-0000-0000-000000000001'
+);
+DO $assert_pending_deposit_and_ownership$
+DECLARE
+  v_sqlstate text;
+  v_request_id uuid;
+BEGIN
+  SELECT id INTO v_request_id
+  FROM public.deposit_requests
+  WHERE user_id = '80000000-0000-0000-0000-000000000008'
+    AND idempotency_key = 'f3000000-0000-0000-0000-000000000001';
+  IF v_request_id IS NULL
+     OR (SELECT status FROM public.deposit_requests WHERE id = v_request_id) <> 'pending'
+     OR (SELECT amount FROM public.deposit_requests WHERE id = v_request_id) <> 300
+     OR (SELECT fee_amount FROM public.deposit_requests WHERE id = v_request_id) <> 21
+     OR (SELECT net_amount FROM public.deposit_requests WHERE id = v_request_id) <> 279
+     OR (SELECT count(*) FROM public.deposit_requests
+         WHERE user_id = '80000000-0000-0000-0000-000000000008') <> 1
+     OR (SELECT balance FROM public.wallet_balances
+         WHERE user_id = '80000000-0000-0000-0000-000000000008'
+           AND asset = 'BTC') <> 1000 THEN
+    RAISE EXCEPTION 'Deposit request, 7%% fee, pending transaction, or no-credit rule failed';
+  END IF;
+  IF (SELECT count(*) FROM public.deposit_requests
+      WHERE user_id = '90000000-0000-0000-0000-000000000009') <> 0 THEN
+    RAISE EXCEPTION 'A user can read another user deposit request';
+  END IF;
+  BEGIN
+    UPDATE public.deposit_requests
+    SET status = 'completed'
+    WHERE id = v_request_id;
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS v_sqlstate = RETURNED_SQLSTATE;
+    IF v_sqlstate <> '42501' THEN
+      RAISE;
+    END IF;
+    RETURN;
+  END;
+  RAISE EXCEPTION 'A user can directly modify deposit request status';
+END;
+$assert_pending_deposit_and_ownership$;
+COMMIT;
+
+DO $assert_pending_deposit_not_credited$
+BEGIN
+  IF (SELECT count(*) FROM public.ledger_entries
+      WHERE request_kind = 'deposit'
+        AND request_id = (
+          SELECT id FROM public.deposit_requests
+          WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000001'
+        )) <> 0
+     OR (SELECT count(*) FROM public.transactions
+         WHERE request_kind = 'deposit'
+           AND request_id = (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000001'
+           )
+           AND status = 'pending'
+           AND amount = 279
+           AND gross_amount = 300
+           AND fee_amount = 21
+           AND net_amount = 279) <> 1
+     OR (SELECT balance FROM public.wallet_balances
+         WHERE user_id = '80000000-0000-0000-0000-000000000008'
+           AND asset = 'BTC') <> 1000 THEN
+    RAISE EXCEPTION 'A pending deposit changed the ledger or wallet balance';
+  END IF;
+END;
+$assert_pending_deposit_not_credited$;
+
+SELECT id AS first_deposit_id
+FROM public.deposit_requests
+WHERE user_id = '80000000-0000-0000-0000-000000000008'
+  AND idempotency_key = 'f3000000-0000-0000-0000-000000000001'
+\gset
+SELECT id AS first_deposit_transaction_id
+FROM public.transactions
+WHERE request_kind = 'deposit' AND request_id = :'first_deposit_id'
+\gset
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '80000000-0000-0000-0000-000000000008',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"80000000-0000-0000-0000-000000000008","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+DO $assert_user_cannot_approve_deposit$
+DECLARE
+  v_sqlstate text;
+BEGIN
+  BEGIN
+    PERFORM public.approve_deposit_request(
+      (SELECT id FROM public.deposit_requests
+       WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000001'),
+      'f6000000-0000-0000-0000-000000000001'
+    );
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS v_sqlstate = RETURNED_SQLSTATE;
+    IF v_sqlstate <> 'P0001' THEN
+      RAISE;
+    END IF;
+    RETURN;
+  END;
+  RAISE EXCEPTION 'A non-admin user approved a deposit';
+END;
+$assert_user_cannot_approve_deposit$;
+COMMIT;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '10000000-0000-0000-0000-000000000001',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","app_metadata":{"admin":"true"}}',
+  true
+);
+SELECT public.approve_deposit_request(
+  :'first_deposit_id',
+  'f6000000-0000-0000-0000-000000000001'
+);
+SELECT public.approve_deposit_request(
+  :'first_deposit_id',
+  'f6000000-0000-0000-0000-000000000001'
+);
+RESET ROLE;
+DO $assert_deposit_credited_once$
+BEGIN
+  IF (SELECT balance FROM public.wallet_balances
+      WHERE user_id = '80000000-0000-0000-0000-000000000008'
+        AND asset = 'BTC') <> 1279
+     OR (SELECT count(*) FROM public.ledger_entries
+         WHERE request_kind = 'deposit'
+           AND request_id = (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000001'
+           )
+           AND entry_type = 'deposit_credit'
+           AND amount = 279) <> 1
+     OR (SELECT count(*) FROM public.transactions
+         WHERE id = (
+           SELECT id FROM public.transactions
+           WHERE request_kind = 'deposit'
+             AND request_id = (
+               SELECT id FROM public.deposit_requests
+               WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000001'
+             )
+         )
+           AND request_kind = 'deposit'
+           AND request_id = (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000001'
+           )
+           AND status = 'completed'
+           AND amount = 279
+           AND gross_amount = 300
+           AND fee_amount = 21
+           AND net_amount = 279) <> 1
+     OR (SELECT count(*) FROM public.financial_request_events
+         WHERE request_kind = 'deposit'
+           AND request_id = (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000001'
+           )
+           AND action = 'deposit_approved') <> 1 THEN
+    RAISE EXCEPTION 'Deposit approval did not update and credit the original transaction exactly once';
+  END IF;
+END;
+$assert_deposit_credited_once$;
+COMMIT;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '80000000-0000-0000-0000-000000000008',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"80000000-0000-0000-0000-000000000008","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+SELECT public.create_deposit_request(
+  'BTC',
+  25,
+  'f3000000-0000-0000-0000-000000000002'
+);
+COMMIT;
+
+SELECT id AS declined_deposit_id
+FROM public.deposit_requests
+WHERE user_id = '80000000-0000-0000-0000-000000000008'
+  AND idempotency_key = 'f3000000-0000-0000-0000-000000000002'
+\gset
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '10000000-0000-0000-0000-000000000001',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","app_metadata":{"admin":"true"}}',
+  true
+);
+SELECT public.decline_deposit_request(
+  :'declined_deposit_id',
+  'Request details could not be verified.',
+  'f6000000-0000-0000-0000-000000000002'
+);
+SELECT public.decline_deposit_request(
+  :'declined_deposit_id',
+  'Request details could not be verified.',
+  'f6000000-0000-0000-0000-000000000002'
+);
+RESET ROLE;
+DO $assert_deposit_failed_once$
+BEGIN
+  IF (SELECT status FROM public.deposit_requests
+      WHERE id = (
+        SELECT id FROM public.deposit_requests
+        WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000002'
+      )) <> 'failed'
+     OR (SELECT status FROM public.transactions
+         WHERE request_kind = 'deposit'
+           AND request_id = (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000002'
+           )) <> 'failed'
+     OR (SELECT count(*) FROM public.ledger_entries
+         WHERE request_kind = 'deposit'
+           AND request_id = (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000002'
+           )
+           AND entry_type = 'deposit_credit') <> 0
+     OR (SELECT count(*) FROM public.financial_request_events
+         WHERE request_kind = 'deposit'
+           AND request_id = (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000002'
+           )
+           AND action = 'deposit_declined'
+           AND details ->> 'reason' = 'Request details could not be verified.') <> 1
+     OR (SELECT balance FROM public.wallet_balances
+         WHERE user_id = '80000000-0000-0000-0000-000000000008'
+           AND asset = 'BTC') <> 1279 THEN
+    RAISE EXCEPTION 'Declined deposit changed the balance or was not marked failed exactly once';
+  END IF;
+END;
+$assert_deposit_failed_once$;
+COMMIT;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '80000000-0000-0000-0000-000000000008',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"80000000-0000-0000-0000-000000000008","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+SELECT public.submit_withdrawal_request(
+  'BTC',
+  'Bitcoin',
+  'bc1qdestinationaddress00000000000000000000',
+  10,
+  'f1000000-0000-0000-0000-000000000001'
+);
+SELECT public.submit_withdrawal_request(
+  'BTC',
+  'Bitcoin',
+  'bc1qdestinationaddress00000000000000000000',
+  10,
+  'f1000000-0000-0000-0000-000000000001'
+);
+DO $assert_withdrawal_reservation$
+DECLARE v_request_id uuid;
+BEGIN
+  SELECT id INTO v_request_id
+  FROM public.withdrawal_requests
+  WHERE user_id = '80000000-0000-0000-0000-000000000008'
+    AND idempotency_key = 'f1000000-0000-0000-0000-000000000001';
+  IF v_request_id IS NULL
+     OR (SELECT status FROM public.withdrawal_requests WHERE id = v_request_id) <> 'pending'
+     OR (SELECT fee_amount FROM public.withdrawal_requests WHERE id = v_request_id) <> 0
+     OR (SELECT net_amount FROM public.withdrawal_requests WHERE id = v_request_id) <> 10
+     OR (SELECT balance FROM public.wallet_balances
+         WHERE user_id = '80000000-0000-0000-0000-000000000008'
+           AND asset = 'BTC') <> 1269
+     THEN
+    RAISE EXCEPTION 'Withdrawal was not reserved once or transaction did not enter processing';
+  END IF;
+  BEGIN
+    PERFORM public.submit_withdrawal_request(
+      'BTC',
+      'Bitcoin',
+      'bc1qinsufficientaddress00000000000000000000',
+      2000,
+      'f1000000-0000-0000-0000-000000000002'
+    );
+    RAISE EXCEPTION 'Insufficient withdrawal balance was unexpectedly accepted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <> 'Insufficient available balance.' THEN
+      RAISE;
+    END IF;
+  END;
+  BEGIN
+    PERFORM public.submit_withdrawal_request(
+      'BTC',
+      'Bitcoin',
+      'bc1qinvalidprecision00000000000000000000',
+      1.001,
+      'f1000000-0000-0000-0000-000000000004'
+    );
+    RAISE EXCEPTION 'A withdrawal amount with sub-cent precision was accepted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <> 'Enter an amount with no more than two decimal places.' THEN
+      RAISE;
+    END IF;
+  END;
+END;
+$assert_withdrawal_reservation$;
+COMMIT;
+
+DO $assert_withdrawal_reserved_once$
+BEGIN
+  IF (SELECT count(*) FROM public.ledger_entries
+      WHERE request_kind = 'withdrawal'
+        AND request_id = (
+          SELECT id FROM public.withdrawal_requests
+          WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+        )
+        AND entry_type = 'withdrawal_reserved') <> 1
+     OR (SELECT status FROM public.transactions
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+           )) <> 'processing'
+     OR (SELECT count(*) FROM public.transactions
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+           )
+           AND gross_amount = 10
+           AND fee_amount = 0
+           AND net_amount = 10) <> 1 THEN
+    RAISE EXCEPTION 'Withdrawal reservation was not recorded exactly once';
+  END IF;
+END;
+$assert_withdrawal_reserved_once$;
+
+SELECT id AS first_withdrawal_id
+FROM public.withdrawal_requests
+WHERE user_id = '80000000-0000-0000-0000-000000000008'
+  AND idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+\gset
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '80000000-0000-0000-0000-000000000008',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"80000000-0000-0000-0000-000000000008","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+DO $assert_user_cannot_approve_withdrawal$
+DECLARE
+  v_sqlstate text;
+BEGIN
+  BEGIN
+    PERFORM public.approve_withdrawal_request(
+      (SELECT id FROM public.withdrawal_requests
+       WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'),
+      'f2000000-0000-0000-0000-000000000001'
+    );
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS v_sqlstate = RETURNED_SQLSTATE;
+    IF v_sqlstate <> 'P0001' THEN
+      RAISE;
+    END IF;
+    RETURN;
+  END;
+  RAISE EXCEPTION 'A non-admin user approved a withdrawal';
+END;
+$assert_user_cannot_approve_withdrawal$;
+COMMIT;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '10000000-0000-0000-0000-000000000001',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","app_metadata":{"admin":"true"}}',
+  true
+);
+SELECT public.approve_withdrawal_request(
+  :'first_withdrawal_id',
+  'f2000000-0000-0000-0000-000000000001'
+);
+SELECT public.approve_withdrawal_request(
+  :'first_withdrawal_id',
+  'f2000000-0000-0000-0000-000000000001'
+);
+RESET ROLE;
+DO $assert_withdrawal_approval$
+BEGIN
+  IF (SELECT balance FROM public.wallet_balances
+      WHERE user_id = '80000000-0000-0000-0000-000000000008'
+        AND asset = 'BTC') <> 1269
+     OR (SELECT status FROM public.withdrawal_requests
+         WHERE id = (
+           SELECT id FROM public.withdrawal_requests
+           WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+         )) <> 'completed'
+     OR (SELECT status FROM public.transactions
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+           )) <> 'completed'
+     OR (SELECT count(*) FROM public.ledger_entries
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+           )
+           AND entry_type = 'withdrawal_debit') <> 1
+     OR (SELECT count(*) FROM public.financial_request_events
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000001'
+           )
+           AND action = 'withdrawal_approved') <> 1 THEN
+    RAISE EXCEPTION 'Withdrawal approval was not completed exactly once';
+  END IF;
+END;
+$assert_withdrawal_approval$;
+COMMIT;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '80000000-0000-0000-0000-000000000008',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"80000000-0000-0000-0000-000000000008","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+SELECT public.submit_withdrawal_request(
+  'BTC',
+  'Bitcoin',
+  'bc1qdeclineaddress00000000000000000000000000',
+  2,
+  'f1000000-0000-0000-0000-000000000003'
+);
+COMMIT;
+
+SELECT id AS declined_withdrawal_id
+FROM public.withdrawal_requests
+WHERE user_id = '80000000-0000-0000-0000-000000000008'
+  AND idempotency_key = 'f1000000-0000-0000-0000-000000000003'
+\gset
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '10000000-0000-0000-0000-000000000001',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","app_metadata":{"admin":"true"}}',
+  true
+);
+SELECT public.decline_withdrawal_request(
+  :'declined_withdrawal_id',
+  'Destination details require correction.',
+  'f2000000-0000-0000-0000-000000000002'
+);
+SELECT public.decline_withdrawal_request(
+  :'declined_withdrawal_id',
+  'Destination details require correction.',
+  'f2000000-0000-0000-0000-000000000002'
+);
+RESET ROLE;
+DO $assert_withdrawal_decline$
+BEGIN
+  IF (SELECT balance FROM public.wallet_balances
+      WHERE user_id = '80000000-0000-0000-0000-000000000008'
+        AND asset = 'BTC') <> 1269
+     OR (SELECT status FROM public.withdrawal_requests
+         WHERE id = (
+           SELECT id FROM public.withdrawal_requests
+           WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000003'
+         )) <> 'failed'
+     OR (SELECT status FROM public.transactions
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000003'
+           )) <> 'failed'
+     OR (SELECT fee_amount FROM public.withdrawal_requests
+         WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000003') <> 0
+     OR (SELECT net_amount FROM public.withdrawal_requests
+         WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000003') <> 2
+     OR (SELECT count(*) FROM public.ledger_entries
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000003'
+           )
+           AND entry_type = 'withdrawal_release') <> 1
+     OR (SELECT count(*) FROM public.financial_request_events
+         WHERE request_kind = 'withdrawal'
+           AND request_id = (
+             SELECT id FROM public.withdrawal_requests
+             WHERE idempotency_key = 'f1000000-0000-0000-0000-000000000003'
+           )
+           AND action = 'withdrawal_declined'
+           AND details ->> 'reason' = 'Destination details require correction.') <> 1 THEN
+    RAISE EXCEPTION 'Withdrawal decline did not release funds or fail exactly once';
+  END IF;
+END;
+$assert_withdrawal_decline$;
+COMMIT;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '10000000-0000-0000-0000-000000000001',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","app_metadata":{"admin":"true"}}',
+  true
+);
+DO $assert_backend_admin_access$
+DECLARE
+  v_requests integer;
+  v_completed integer;
+  v_failed integer;
+  v_processing integer;
+  v_approved integer;
+  v_verified integer;
+  v_pending_deposit integer;
+  v_history integer;
+  v_overview jsonb;
+BEGIN
+  SELECT count(*) INTO v_requests
+  FROM public.get_backend_requests('all', 'all', '', 100, 0);
+  SELECT count(*) INTO v_completed
+  FROM public.get_backend_requests('all', 'completed', '', 100, 0);
+  SELECT count(*) INTO v_failed
+  FROM public.get_backend_requests('all', 'failed', '', 100, 0);
+  SELECT count(*) INTO v_processing
+  FROM public.get_backend_requests('all', 'processing', '', 100, 0);
+  SELECT count(*) INTO v_approved
+  FROM public.get_backend_requests('all', 'approved', '', 100, 0);
+  SELECT count(*) INTO v_verified
+  FROM public.get_backend_requests('all', 'verified', '', 100, 0);
+  SELECT count(*) INTO v_pending_deposit
+  FROM public.get_backend_requests('deposit', 'pending', '', 100, 0);
+  SELECT count(*) INTO v_history
+  FROM public.get_backend_history('all', '', 100);
+  SELECT public.get_backend_overview() INTO v_overview;
+  IF v_requests <> 8 OR v_completed <> 2 OR v_failed <> 2
+     OR v_processing <> 1 OR v_approved <> 1 OR v_verified <> 1
+     OR v_pending_deposit <> 1
+     OR v_history < 8
+     OR (v_overview ->> 'pending_withdrawals')::integer <> 0
+     OR (v_overview ->> 'pending_deposits')::integer <> 1
+     OR (v_overview ->> 'processing_requests')::integer <> 1 THEN
+    RAISE EXCEPTION 'Admin Backend queries or status filters returned unexpected results';
+  END IF;
+END;
+$assert_backend_admin_access$;
+COMMIT;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '90000000-0000-0000-0000-000000000009',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"90000000-0000-0000-0000-000000000009","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+DO $assert_non_admin_backend_access$
+DECLARE
+  v_sqlstate text;
+BEGIN
+  BEGIN
+    PERFORM * FROM public.get_backend_requests('all', 'all', '', 100, 0);
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS v_sqlstate = RETURNED_SQLSTATE;
+    IF v_sqlstate <> 'P0001' THEN
+      RAISE;
+    END IF;
+    RETURN;
+  END;
+  RAISE EXCEPTION 'A non-admin user accessed Backend requests';
+END;
+$assert_non_admin_backend_access$;
+COMMIT;
+
+DO $financial_request_privileges$
+BEGIN
+  IF has_table_privilege('authenticated', 'public.withdrawal_requests', 'UPDATE')
+     OR has_table_privilege('authenticated', 'public.deposit_requests', 'INSERT')
+     OR has_table_privilege('authenticated', 'public.financial_request_events', 'SELECT')
+     OR has_column_privilege(
+       'authenticated',
+       'public.deposit_requests',
+       'reviewed_by',
+       'SELECT'
+     )
+     OR has_column_privilege(
+       'authenticated',
+       'public.deposit_requests',
+       'provider_reference',
+       'SELECT'
+     )
+     OR to_regclass('public.withdrawal_network_fees') IS NULL
+     OR to_regclass('public.deposit_destinations') IS NULL
+     OR to_regprocedure('public.verify_deposit_request(uuid,text,text,uuid)') IS NOT NULL
+     OR to_regprocedure('public.complete_verified_withdrawal(uuid,text,text,uuid)') IS NOT NULL
+     OR to_regprocedure('public.mark_withdrawal_processing(uuid,uuid)') IS NOT NULL
+     OR to_regprocedure('public.create_deposit_request(text,text,numeric,uuid)') IS NOT NULL
+     OR to_regprocedure('public.create_deposit_request(text,numeric,uuid)') IS NULL
+     OR EXISTS (
+       SELECT 1
+       FROM pg_proc
+       WHERE pronamespace = 'public'::regnamespace
+         AND proname IN ('get_backend_requests', 'get_backend_history')
+         AND proargnames && ARRAY[
+           'provider', 'provider_reference', 'provider_verified_at'
+         ]::text[]
+     ) THEN
+    RAISE EXCEPTION 'Internal workflow privileges or provider-removal checks failed';
+  END IF;
+END;
+$financial_request_privileges$;
+
+SELECT 'Local internal financial request workflow assertions passed.' AS result;
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '80000000-0000-0000-0000-000000000008',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"80000000-0000-0000-0000-000000000008","role":"authenticated","app_metadata":{"admin":"false"}}',
+  true
+);
+DO $assert_deposit_subcent_rejected$
+BEGIN
+  BEGIN
+    PERFORM public.create_deposit_request(
+      'BTC',
+      1.001,
+      'f3000000-0000-0000-0000-000000000016'
+    );
+    RAISE EXCEPTION 'A deposit amount with sub-cent precision was accepted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM <> 'Enter an amount with no more than two decimal places.' THEN
+      RAISE;
+    END IF;
+  END;
+END;
+$assert_deposit_subcent_rejected$;
+SELECT public.create_deposit_request('BTC', 100, 'f3000000-0000-0000-0000-000000000010');
+SELECT public.create_deposit_request('BTC', 200, 'f3000000-0000-0000-0000-000000000011');
+SELECT public.create_deposit_request('BTC', 300, 'f3000000-0000-0000-0000-000000000012');
+SELECT public.create_deposit_request('BTC', 500, 'f3000000-0000-0000-0000-000000000013');
+SELECT public.create_deposit_request('BTC', 1000, 'f3000000-0000-0000-0000-000000000014');
+SELECT public.create_deposit_request('BTC', 0.50, 'f3000000-0000-0000-0000-000000000015');
+DO $assert_deposit_cent_precision$
+BEGIN
+  IF (SELECT count(*) FROM public.deposit_requests
+      WHERE idempotency_key BETWEEN
+        'f3000000-0000-0000-0000-000000000010'::uuid
+        AND 'f3000000-0000-0000-0000-000000000015'::uuid
+        AND status = 'pending'
+        AND fee_amount = CASE amount
+          WHEN 100 THEN 7
+          WHEN 200 THEN 14
+          WHEN 300 THEN 21
+          WHEN 500 THEN 35
+          WHEN 1000 THEN 70
+          WHEN 0.50 THEN 0.04
+        END
+        AND net_amount = CASE amount
+          WHEN 100 THEN 93
+          WHEN 200 THEN 186
+          WHEN 300 THEN 279
+          WHEN 500 THEN 465
+          WHEN 1000 THEN 930
+          WHEN 0.50 THEN 0.46
+        END
+        AND round(fee_amount, 2) = fee_amount
+        AND round(net_amount, 2) = net_amount) <> 6 THEN
+    RAISE EXCEPTION 'Deposit examples or two-decimal fee rounding did not reconcile';
+  END IF;
+END;
+$assert_deposit_cent_precision$;
+COMMIT;
+
+SELECT id AS deposit_10_id FROM public.deposit_requests WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000010' \gset
+SELECT id AS deposit_11_id FROM public.deposit_requests WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000011' \gset
+SELECT id AS deposit_12_id FROM public.deposit_requests WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000012' \gset
+SELECT id AS deposit_13_id FROM public.deposit_requests WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000013' \gset
+SELECT id AS deposit_14_id FROM public.deposit_requests WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000014' \gset
+SELECT id AS deposit_15_id FROM public.deposit_requests WHERE idempotency_key = 'f3000000-0000-0000-0000-000000000015' \gset
+
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config(
+  'request.jwt.claim.sub',
+  '10000000-0000-0000-0000-000000000001',
+  true
+);
+SELECT set_config(
+  'request.jwt.claims',
+  '{"sub":"10000000-0000-0000-0000-000000000001","role":"authenticated","app_metadata":{"admin":"true"}}',
+  true
+);
+SELECT public.approve_deposit_request(
+  :'deposit_10_id',
+  'f6000000-0000-0000-0000-000000000010'
+);
+SELECT public.approve_deposit_request(
+  :'deposit_11_id',
+  'f6000000-0000-0000-0000-000000000011'
+);
+SELECT public.approve_deposit_request(
+  :'deposit_12_id',
+  'f6000000-0000-0000-0000-000000000012'
+);
+SELECT public.approve_deposit_request(
+  :'deposit_13_id',
+  'f6000000-0000-0000-0000-000000000013'
+);
+SELECT public.approve_deposit_request(
+  :'deposit_14_id',
+  'f6000000-0000-0000-0000-000000000014'
+);
+SELECT public.approve_deposit_request(
+  :'deposit_15_id',
+  'f6000000-0000-0000-0000-000000000015'
+);
+RESET ROLE;
+DO $assert_deposit_examples_credited_once$
+BEGIN
+  IF (SELECT balance FROM public.wallet_balances
+      WHERE user_id = '80000000-0000-0000-0000-000000000008'
+        AND asset = 'BTC') <> 3222.46
+     OR (SELECT count(*) FROM public.ledger_entries
+         WHERE request_kind = 'deposit'
+           AND request_id IN (
+             SELECT id FROM public.deposit_requests
+             WHERE idempotency_key BETWEEN
+               'f3000000-0000-0000-0000-000000000010'::uuid
+               AND 'f3000000-0000-0000-0000-000000000015'::uuid
+           )
+           AND entry_type = 'deposit_credit') <> 6
+     OR EXISTS (
+       SELECT 1
+       FROM public.deposit_requests AS request
+       JOIN public.transactions AS txn
+         ON txn.request_kind = 'deposit'
+        AND txn.request_id = request.id
+       WHERE request.idempotency_key BETWEEN
+         'f3000000-0000-0000-0000-000000000010'::uuid
+         AND 'f3000000-0000-0000-0000-000000000015'::uuid
+         AND (
+           request.status <> 'completed'
+           OR txn.status <> 'completed'
+           OR txn.amount <> request.net_amount
+           OR txn.gross_amount <> round(request.amount, 2)
+           OR txn.fee_amount <> request.fee_amount
+           OR txn.net_amount <> request.net_amount
+         )
+     ) THEN
+    RAISE EXCEPTION 'Deposit approvals did not credit reconciled net amounts exactly once';
+  END IF;
+END;
+$assert_deposit_examples_credited_once$;
+COMMIT;

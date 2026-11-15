@@ -7,7 +7,8 @@ CREATE ROLE service_role NOLOGIN BYPASSRLS;
 CREATE SCHEMA auth;
 CREATE TABLE auth.users (
   id uuid PRIMARY KEY,
-  email text UNIQUE NOT NULL
+  email text UNIQUE NOT NULL,
+  raw_user_meta_data jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE FUNCTION auth.uid()

@@ -6,12 +6,13 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test app/product-utils.test.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.3",
     "lucide-react": "^1.57.0",
-    "next": "16.4.0",
+    "next": "^16.4.3",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
